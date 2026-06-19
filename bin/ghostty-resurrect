@@ -1,0 +1,330 @@
+#!/usr/bin/env node
+/**
+ * ghostty-resurrect — back up & restore Ghostty tabs, panes, and the
+ * Claude Code / Codex sessions running inside them.
+ *
+ * Captures the full Ghostty layout (windows -> tabs -> panes) and, for every
+ * pane running a Claude Code or Codex CLI session, records the resumable
+ * session id. `restore` reopens Ghostty with the same tabs/panes and
+ * auto-resumes each session via `claude --resume <id>` / `codex resume <id>`.
+ *
+ * Join mechanism: a running agent process's start time matches the birth-time
+ * of its session transcript; Claude's `aiTitle` field is a second confirm
+ * against the live pane title.
+ *
+ * Requirements: macOS, Ghostty >= 1.3.0 (AppleScript dictionary), Node >= 18 or Bun.
+ * License: MIT.
+ */
+"use strict";
+const { homedir } = require("os");
+const { join } = require("path");
+const { spawnSync } = require("child_process");
+const {
+  readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync,
+} = require("fs");
+
+const HOME = homedir();
+const STORE = join(HOME, ".config", "ghostty-resurrect");
+const US = ""; // field separator emitted by the capture AppleScript
+
+// ---------- shell helpers ----------
+function sh(cmd) {
+  const r = spawnSync(cmd[0], cmd.slice(1), { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  return r.stdout || "";
+}
+function osascript(script) {
+  const tmp = join("/tmp", `ghostty-resurrect-${process.pid}-${Math.abs(hash(script))}.applescript`);
+  writeFileSync(tmp, script);
+  const out = sh(["osascript", tmp]);
+  try { unlinkSync(tmp); } catch (_) {}
+  return out;
+}
+function hash(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; }
+function stripGlyph(t) { return t.replace(/^[^\p{L}\p{N}]+/u, "").trim(); }
+
+// ---------- process / session index ----------
+function epochOf(lstart) { const ms = Date.parse(lstart); return isNaN(ms) ? 0 : Math.floor(ms / 1000); }
+function birthtime(f) { const o = sh(["stat", "-f", "%B", f]).trim(); return o ? parseInt(o, 10) : 0; }
+
+function runningAgents() {
+  const out = sh(["ps", "-axww", "-o", "pid=,lstart=,command="]);
+  const procs = [];
+  for (const line of out.split("\n")) {
+    const t = line.trim().split(/\s+/);
+    if (t.length < 7) continue;
+    const pid = parseInt(t[0], 10);
+    const lstart = epochOf(t.slice(1, 6).join(" "));
+    const cmd = t.slice(6).join(" ");
+    let tool = null;
+    if (/(^|\/)claude(\s|$)/.test(cmd) && !/codex/.test(cmd)) tool = "claude";
+    else if (/@openai\/codex.*\/bin\/codex|codex-[a-z0-9-]+\/vendor.*\/bin\/codex/.test(cmd)) tool = "codex";
+    if (tool && pid) procs.push({ pid, lstart, tool });
+  }
+  if (!procs.length) return [];
+  const cwds = cwdOf(procs.map((p) => p.pid));
+  const agents = [];
+  for (const p of procs) {
+    const cwd = cwds.get(p.pid);
+    if (!cwd) continue;
+    const a = { tool: p.tool, pid: p.pid, cwd, lstart: p.lstart, sessionId: undefined, title: undefined };
+    if (p.tool === "claude") resolveClaude(a); else resolveCodex(a);
+    agents.push(a);
+  }
+  return agents;
+}
+
+function cwdOf(pids) {
+  const m = new Map();
+  if (!pids.length) return m;
+  const out = sh(["lsof", "-a", "-d", "cwd", "-p", pids.join(","), "-Fpn"]);
+  let cur = 0;
+  for (const line of out.split("\n")) {
+    if (line[0] === "p") cur = parseInt(line.slice(1), 10);
+    else if (line[0] === "n") m.set(cur, line.slice(1));
+  }
+  return m;
+}
+
+function encClaudeDir(cwd) { return cwd.replace(/[/._]/g, "-"); }
+
+function lastAiTitle(file) {
+  try {
+    const data = readFileSync(file, "utf8");
+    const m = data.match(/"aiTitle":"((?:[^"\\]|\\.)*)"/g);
+    if (m && m.length) {
+      const last = m[m.length - 1].match(/"aiTitle":"((?:[^"\\]|\\.)*)"/);
+      if (last) return JSON.parse('"' + last[1] + '"');
+    }
+  } catch (_) {}
+  return undefined;
+}
+
+function claudeSessionsFor(cwd) {
+  const dir = join(HOME, ".claude", "projects", encClaudeDir(cwd));
+  if (!existsSync(dir)) return [];
+  const res = [];
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".jsonl")) continue;
+    const file = join(dir, f);
+    let st; try { st = statSync(file); } catch (_) { continue; }
+    res.push({ id: f.replace(/\.jsonl$/, ""), file, btime: birthtime(file), mtime: Math.floor(st.mtimeMs / 1000) });
+  }
+  return res;
+}
+
+// Cached, most-recent-first session list per cwd (capped to bound file reads).
+const _sessByCwd = new Map();
+function claudeSessionsCached(cwd) {
+  let s = _sessByCwd.get(cwd);
+  if (!s) { s = claudeSessionsFor(cwd).sort((a, b) => b.mtime - a.mtime).slice(0, 80); _sessByCwd.set(cwd, s); }
+  return s;
+}
+const _aiTitle = new Map();
+function aiTitleOf(file) {
+  if (_aiTitle.has(file)) return _aiTitle.get(file);
+  const t = lastAiTitle(file); _aiTitle.set(file, t); return t;
+}
+
+function resolveClaude(a) {
+  const cands = claudeSessionsFor(a.cwd);
+  if (!cands.length) return;
+  cands.sort((x, y) => Math.abs(x.btime - a.lstart) - Math.abs(y.btime - a.lstart));
+  a.sessionId = cands[0].id;
+  a.title = lastAiTitle(cands[0].file);
+}
+
+let codexCache = null;
+function allCodexSessions() {
+  if (codexCache) return codexCache;
+  const root = join(HOME, ".codex", "sessions");
+  const out = [];
+  const cutoff = Math.floor(Date.now() / 1000) - 30 * 86400;
+  function walk(d) {
+    let ents; try { ents = readdirSync(d, { withFileTypes: true }); } catch (_) { return; }
+    for (const e of ents) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) {
+        const um = e.name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/);
+        if (!um) continue;
+        let st; try { st = statSync(p); } catch (_) { continue; }
+        if (st.mtimeMs / 1000 < cutoff) continue;
+        let cwd = "";
+        try {
+          const head = readFileSync(p, "utf8").slice(0, 4000);
+          const cm = head.match(/"cwd":"((?:[^"\\]|\\.)*)"/);
+          if (cm) cwd = JSON.parse('"' + cm[1] + '"');
+        } catch (_) {}
+        out.push({ uuid: um[1], cwd, btime: birthtime(p) });
+      }
+    }
+  }
+  walk(root);
+  codexCache = out;
+  return out;
+}
+
+function resolveCodex(a) {
+  const cands = allCodexSessions().filter((s) => s.cwd === a.cwd);
+  if (!cands.length) return;
+  cands.sort((x, y) => Math.abs(x.btime - a.lstart) - Math.abs(y.btime - a.lstart));
+  a.sessionId = cands[0].uuid;
+}
+
+// ---------- layout capture ----------
+const CAPTURE = `set US to (ASCII character 31)
+set LF to (ASCII character 10)
+set out to ""
+tell application "Ghostty"
+  repeat with w in windows
+    set out to out & "W" & LF
+    repeat with t in tabs of w
+      set sel to "0"
+      if selected of t then set sel to "1"
+      set out to out & "T" & US & sel & US & (name of t) & LF
+      repeat with trm in terminals of t
+        set out to out & "P" & US & (working directory of trm) & US & (name of trm) & LF
+      end repeat
+    end repeat
+  end repeat
+end tell
+return out`;
+
+function capture(name) {
+  const raw = osascript(CAPTURE);
+  if (!raw.trim()) { console.error("No Ghostty windows found (is Ghostty running, and is it >= 1.3.0?)."); process.exit(1); }
+  const agents = runningAgents();
+  const used = new Set();        // running-agent objects already claimed
+  const usedIds = new Set();     // session ids already assigned (dedup across panes)
+  const windows = [];
+  let curWin = null, curTab = null;
+  for (const line of raw.split("\n")) {
+    if (line === "W") { curWin = { tabs: [] }; windows.push(curWin); curTab = null; continue; }
+    const parts = line.split(US);
+    if (parts[0] === "T" && curWin) {
+      curTab = { name: parts[2] || "", selected: parts[1] === "1", panes: [] };
+      curWin.tabs.push(curTab);
+    } else if (parts[0] === "P" && curTab) {
+      curTab.panes.push(resolvePane(parts[1] || HOME, parts[2] || "", agents, used, usedIds));
+    }
+  }
+  return { name, savedAt: new Date().toISOString(), windows };
+}
+
+function resolvePane(cwd, title, agents, used, usedIds) {
+  const clean = stripGlyph(title);
+  // 1) Claude — authoritative: pane title equals a session transcript's aiTitle.
+  //    This maps each pane to its own unique session (deduped by id).
+  if (clean) {
+    const m = claudeSessionsCached(cwd).filter((s) => !usedIds.has(s.id) && aiTitleOf(s.file) === clean);
+    if (m.length) { usedIds.add(m[0].id); return { cwd, title: clean, tool: "claude", sessionId: m[0].id }; }
+  }
+  // 2) Codex running in this cwd.
+  let a = agents.find((x) => !used.has(x) && x.tool === "codex" && x.cwd === cwd && (!x.sessionId || !usedIds.has(x.sessionId)));
+  // 3) Any running agent in this cwd whose session id is not already taken.
+  if (!a) a = agents.find((x) => !used.has(x) && x.cwd === cwd && (!x.sessionId || !usedIds.has(x.sessionId)));
+  if (a) { used.add(a); if (a.sessionId) usedIds.add(a.sessionId); return { cwd, title: clean, tool: a.tool, sessionId: a.sessionId }; }
+  return { cwd, title: clean, tool: "shell" };
+}
+
+// ---------- restore ----------
+function resumeCmd(p) {
+  if (p.tool === "claude") return p.sessionId ? `claude --resume ${p.sessionId}` : "claude --continue";
+  if (p.tool === "codex") return p.sessionId ? `codex resume ${p.sessionId}` : "codex resume --last";
+  return null;
+}
+function aesc(s) { return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"'); }
+function cfgLines(v, p) {
+  const cmd = resumeCmd(p);
+  let s = `set ${v} to new surface configuration\n`;
+  s += `set initial working directory of ${v} to "${aesc(p.cwd)}"\n`;
+  if (cmd) s += `set initial input of ${v} to "${aesc(cmd)}" & LF\n`;
+  return s;
+}
+
+function buildRestoreScript(b) {
+  let s = `set LF to (ASCII character 10)\ntell application "Ghostty"\n  activate\n`;
+  let v = 0;
+  for (const w of b.windows) {
+    if (!w.tabs.length) continue;
+    for (let ti = 0; ti < w.tabs.length; ti++) {
+      const tab = w.tabs[ti];
+      if (!tab.panes.length) continue;
+      const c = `cfg${v++}`;
+      s += cfgLines(c, tab.panes[0]);
+      if (ti === 0) {
+        s += `set win to new window with configuration ${c}\n`;
+        s += `set tb to selected tab of win\n`;
+      } else {
+        s += `set tb to new tab in win with configuration ${c}\n`;
+      }
+      s += `set lastTerm to focused terminal of tb\n`;
+      for (let pi = 1; pi < tab.panes.length; pi++) {
+        const pc = `cfg${v++}`;
+        s += cfgLines(pc, tab.panes[pi]);
+        s += `set lastTerm to split lastTerm direction right with configuration ${pc}\n`;
+      }
+    }
+  }
+  s += "end tell\n";
+  return s;
+}
+
+// ---------- io ----------
+function pathFor(name) { return join(STORE, `${name}.json`); }
+function save(b) { mkdirSync(STORE, { recursive: true }); writeFileSync(pathFor(b.name), JSON.stringify(b, null, 2)); }
+function load(name) { return JSON.parse(readFileSync(pathFor(name), "utf8")); }
+
+function summarize(b) {
+  const lines = [];
+  let np = 0, na = 0;
+  b.windows.forEach((w, wi) => {
+    lines.push(`Window ${wi + 1}`);
+    w.tabs.forEach((t, idx) => {
+      lines.push(`  Tab ${idx + 1}${t.selected ? " *" : ""}: ${t.name}`);
+      for (const p of t.panes) {
+        np++;
+        if (p.tool !== "shell") na++;
+        const tag = p.tool === "shell" ? "shell" : `${p.tool}${p.sessionId ? " " + p.sessionId.slice(0, 8) : " (no id)"}`;
+        lines.push(`     - [${tag}] ${p.title || p.cwd}`);
+      }
+    });
+  });
+  lines.push(`\n${b.windows.length} window(s), ${np} pane(s), ${na} agent session(s).`);
+  return lines.join("\n");
+}
+
+// ---------- cli ----------
+const [, , cmd, arg] = process.argv;
+const name = arg && !arg.startsWith("-") ? arg : "latest";
+
+if (cmd === "backup") {
+  const b = capture(name);
+  save(b);
+  console.log(summarize(b));
+  console.log(`\nSaved -> ${pathFor(name)}`);
+} else if (cmd === "restore") {
+  if (!existsSync(pathFor(name))) { console.error(`No backup named "${name}" at ${pathFor(name)}`); process.exit(1); }
+  const b = load(name);
+  const script = buildRestoreScript(b);
+  if (process.argv.includes("--dry-run")) { console.log(script); process.exit(0); }
+  osascript(script);
+  console.log(`Restored ${name}: ${b.windows.length} window(s).`);
+} else if (cmd === "list") {
+  if (!existsSync(STORE)) { console.log("No backups yet."); process.exit(0); }
+  for (const f of readdirSync(STORE).filter((f) => f.endsWith(".json"))) {
+    const b = load(f.replace(/\.json$/, ""));
+    console.log(`${b.name}\t${b.savedAt}\t${b.windows.length} win`);
+  }
+} else if (cmd === "show") {
+  console.log(summarize(load(name)));
+} else {
+  console.log(`ghostty-resurrect — back up & restore Ghostty tabs, panes, and Claude/Codex sessions
+
+Usage:
+  ghostty-resurrect backup [name]              capture current Ghostty layout + sessions (default: latest)
+  ghostty-resurrect restore [name]             reopen Ghostty with saved layout, resume sessions
+  ghostty-resurrect restore [name] --dry-run   print the AppleScript without running it
+  ghostty-resurrect show [name]                print a saved backup
+  ghostty-resurrect list                       list saved backups`);
+}
